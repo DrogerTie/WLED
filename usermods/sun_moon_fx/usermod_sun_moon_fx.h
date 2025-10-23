@@ -11,7 +11,6 @@ extern WS2812FX strip;
 
 class Usermod_sun_moon_fx : public Usermod {
 private:
-  // Config keys
   static const char _name[];
   static const char _enabled[];
   static const char _map_width_cm[];
@@ -23,12 +22,11 @@ private:
   static const char _show_sun[];
   static const char _show_moon[];
   static const char _local_night_mode[];
+  static const char _realistic_mode[];
 
-  // FX data registration string
   static const char _data_FX_MODE_SUNMOON[] PROGMEM;
 
 public:
-  // Static config
   static bool enabled;
   static byte map_width_cm;
   static byte map_height_cm;
@@ -39,12 +37,12 @@ public:
   static bool show_sun;
   static bool show_moon;
   static bool local_night_mode;
+  static bool realistic_mode;
   static unsigned long lastCheck;
   static int8_t tzOffset;
 
   // ------------------ Astronomical helpers ------------------
   static double unixToJD(time_t unix) { return (unix / 86400.0) + 2440587.5; }
-
   static double getGMST(double jd) {
     double d = jd - 2451545.0;
     double T = d / 36525.0;
@@ -52,13 +50,11 @@ public:
                   0.000387933 * T * T - T * T * T / 38710000.0;
     return fmod(gmst, 360.0);
   }
-
   static double getSunDecl(double jd) {
     double n = fmod(jd - 2451545.0 + 10, 365.25);
     double angle = 2 * M_PI * (284 + n) / 365.25;
     return 23.45 * sin(angle);
   }
-
   static double getSunEclLon(double jd) {
     double d = jd - 2451545.0;
     double T = d / 36525.0;
@@ -66,7 +62,6 @@ public:
     L = fmod(L, 360.0);
     return L;
   }
-
   static double getSunLon(double jd) {
     double gmst = getGMST(jd);
     double L = getSunEclLon(jd);
@@ -75,21 +70,18 @@ public:
     else if (lon < -180) lon += 360;
     return lon;
   }
-
   static double getMoonEclLon(double jd) {
     double d = jd - 2451545.0;
     double L = 218.316 + 13.176396 * d;
     L += 6.289 * sin(13.176396 * d * M_PI / 180.0);
     return fmod(L, 360.0);
   }
-
   static double getMoonEclLat(double jd) {
     double d = jd - 2451545.0;
     double L = getMoonEclLon(jd);
     double B = 5.13 * sin(M_PI / 180 * (L - 218.32));
     return B;
   }
-
   static double getMoonLon(double jd) {
     double gmst = getGMST(jd);
     double moon_ecl_lon = getMoonEclLon(jd);
@@ -98,7 +90,6 @@ public:
     else if (lon < -180) lon += 360;
     return lon;
   }
-
   static double haversine(double lat1, double lon1, double lat2, double lon2) {
     double dlat = (lat2 - lat1) * M_PI / 180.0;
     double dlon = (lon2 - lon1) * M_PI / 180.0;
@@ -142,21 +133,21 @@ public:
   }
 
   // ------------------ Setup & Loop ------------------
-  void setup() {
+  void setup() override {
     DEBUG_PRINTLN(F("Sun & Moon FX Usermod loaded"));
     if (enabled) {
       strip.addEffect(255, mode_sunMoon, (char*)_data_FX_MODE_SUNMOON);
     }
   }
 
-  void loop() {
+  void loop() override {
     if (millis() - lastCheck > 30000UL) {
       lastCheck = millis();
       DEBUG_PRINTF("SunMoon FX active: %s\n", enabled ? "yes" : "no");
     }
   }
 
-  void addToJsonInfo(JsonObject* root) {
+    void addToJsonInfo(JsonObject* root) {
     JsonObject sm = (*root).createNestedObject(F("sunmoonfx"));
     sm["enabled"] = enabled;
   }
@@ -173,6 +164,7 @@ public:
     top[FPSTR(_show_sun)] = show_sun;
     top[FPSTR(_show_moon)] = show_moon;
     top[FPSTR(_local_night_mode)] = local_night_mode;
+    top[FPSTR(_realistic_mode)] = realistic_mode;
   }
 
   bool readFromConfig(JsonObject &root) {
@@ -189,13 +181,14 @@ public:
     getJsonValue(top[FPSTR(_show_sun)], show_sun, true);
     getJsonValue(top[FPSTR(_show_moon)], show_moon, true);
     getJsonValue(top[FPSTR(_local_night_mode)], local_night_mode, false);
+    getJsonValue(top[FPSTR(_realistic_mode)], realistic_mode, false);
 
     return true;
   }
 
-  uint16_t getId() { return USERMOD_ID_USER_FX; }
+  uint16_t getId() override { return USERMOD_ID_USER_FX; }
 
-  // ------------------ FX Function ------------------
+  // --- Main FX Function ---
   static uint16_t mode_sunMoon() {
     static unsigned long lastUpdate = 0;
     if (!enabled || millis() - lastUpdate < 60000UL) return 50;
@@ -208,15 +201,42 @@ public:
     double moon_lat = getMoonEclLat(jd);
     double moon_lon = getMoonLon(jd);
 
-    Serial.printf("SunMoonFX: Sun %.1f° %.1f° | Moon %.1f° %.1f°\n",
-      sun_lat, sun_lon, moon_lat, moon_lon);
+    // Local Night Logic
+    bool showSun = show_sun;
+    bool showMoon = show_moon;
+
+    if (local_night_mode) {
+      // It is 'night' when the Sun is over the horizon at localtime
+      time_t utc = t - tzOffset * 3600;
+      double jdLocal = unixToJD(utc);
+      double lonLocal = 0; // middlepoint map
+      double diff = fabs(sun_lon - lonLocal);
+      bool isNight = (diff > 90 && diff < 270);
+      if (isNight) {
+        showSun = false;
+        showMoon = true;
+      } else {
+        showSun = true;
+        showMoon = false;
+      }
+    }
 
     for (int i = 0; i < SEGLEN; i++) {
       double lat, lon;
       ledToLatLon(SEGMENT.start + i, lat, lon);
       uint32_t color = 0;
 
-      if (show_sun) {
+      // --- Realistic mode daylight shading ---
+      if (realistic_mode) {
+        double lonDiff = fabs(lon - sun_lon);
+        if (lonDiff > 180) lonDiff = 360 - lonDiff;
+        double dayFactor = cos(lonDiff * M_PI / 180.0);
+        uint8_t baseBri = (uint8_t)(constrain((dayFactor + 1.0) / 2.0 * 255, 0, 255));
+        color = RGBW32(baseBri, baseBri * 0.8, baseBri * 0.5, 0);
+      }
+
+      // --- Sun rendering ---
+      if (showSun) {
         double dist = haversine(lat, lon, sun_lat, sun_lon);
         if (dist < 45.0) {
           float fade = cos(dist * M_PI / 90.0);
@@ -224,7 +244,9 @@ public:
           color = addColors(color, RGBW32(bri, bri * 0.7, 0, 0));
         }
       }
-      if (show_moon) {
+
+      // --- Moon rendering ---
+      if (showMoon) {
         double dist = haversine(lat, lon, moon_lat, moon_lon);
         if (dist < 45.0) {
           float fade = cos(dist * M_PI / 90.0);
@@ -232,13 +254,15 @@ public:
           color = addColors(color, RGBW32(bri, bri, bri, 0));
         }
       }
+
       SEGMENT.setPixelColor(i, color);
     }
     return 50;
   }
 };
 
-// ------------------ Static definitions ------------------
+
+// --- Static variable definitions ---
 const char Usermod_sun_moon_fx::_name[] PROGMEM = "sunmoonfx";
 const char Usermod_sun_moon_fx::_enabled[] PROGMEM = "enabled";
 const char Usermod_sun_moon_fx::_map_width_cm[] PROGMEM = "Map width in cm";
@@ -250,6 +274,7 @@ const char Usermod_sun_moon_fx::_lower_last_led[] PROGMEM = "Lower last led";
 const char Usermod_sun_moon_fx::_show_sun[] PROGMEM = "Show Sun";
 const char Usermod_sun_moon_fx::_show_moon[] PROGMEM = "Show Moon";
 const char Usermod_sun_moon_fx::_local_night_mode[] PROGMEM = "local night";
+const char Usermod_sun_moon_fx::_realistic_mode[] PROGMEM = "realistic";
 
 const char Usermod_sun_moon_fx::_data_FX_MODE_SUNMOON[] PROGMEM = "🌞 Sun & Moon FX@!;!;!;01";
 
@@ -263,8 +288,10 @@ int Usermod_sun_moon_fx::lower_last_led = 199;
 bool Usermod_sun_moon_fx::show_sun = true;
 bool Usermod_sun_moon_fx::show_moon = true;
 bool Usermod_sun_moon_fx::local_night_mode = false;
+bool Usermod_sun_moon_fx::realistic_mode = false;
 unsigned long Usermod_sun_moon_fx::lastCheck = 0;
 int8_t Usermod_sun_moon_fx::tzOffset = 0;
 
+// Register usermod with WLED
 static Usermod_sun_moon_fx sunMoonUsermod;
 REGISTER_USERMOD(sunMoonUsermod);
